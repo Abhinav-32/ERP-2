@@ -1,13 +1,26 @@
-<?php
 // File: api_handler.php
+
+require 'vendor/autoload.php'; // Autoload Composer packages
+
+use Automattic\WooCommerce\Client;
 
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: POST, GET');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 
+// WooCommerce API credentials
+$woocommerce = new Client(
+    'https://your-store-url.com',
+    'ck_your_consumer_key',
+    'cs_your_consumer_secret',
+    [
+        'version' => 'wc/v3',
+    ]
+);
+
 // Function to handle invoice insertion
-function insert_invoice() {
+function insert_invoice($woocommerce) {
     if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
         http_response_code(405);
         echo json_encode(['error' => 'Method Not Allowed']);
@@ -22,6 +35,7 @@ function insert_invoice() {
         exit;
     }
 
+    // Required fields
     $requiredFields = [
         'transactionSiteCode', 'orderType', 'intgInvoiceId', 'omsInvoiceNo',
         'omsInvoiceDate', 'tradeGroup', 'valueDetails', 'deliveryDetails', 'referenceNo', 'eInvoiceAppl'
@@ -35,6 +49,7 @@ function insert_invoice() {
         }
     }
 
+    // Validate orderType
     $validOrderTypes = ['NEW', 'RETURN', 'EXCHANGE'];
     if (!in_array($data['orderType'], $validOrderTypes)) {
         http_response_code(400);
@@ -42,6 +57,7 @@ function insert_invoice() {
         exit;
     }
 
+    // Check parent order IDs for RETURN or EXCHANGE orders
     if (in_array($data['orderType'], ['RETURN', 'EXCHANGE'])) {
         if (empty($data['parentErpOrderId']) && empty($data['parentIntgRefOrderId'])) {
             http_response_code(400);
@@ -50,24 +66,28 @@ function insert_invoice() {
         }
     }
 
+    // Validate erpOrderId and intgRefOrderId
     if (!empty($data['erpOrderId']) && !empty($data['intgRefOrderId'])) {
         http_response_code(400);
         echo json_encode(['error' => 'Both erpOrderId and intgRefOrderId cannot be present together']);
         exit;
     }
 
+    // Validate intgInvoiceId
     if (!is_string($data['intgInvoiceId'])) {
         http_response_code(400);
         echo json_encode(['error' => 'intgInvoiceId must be a string']);
         exit;
     }
 
+    // Validate parentIntgInvoiceId for RETURN order type
     if ($data['orderType'] === 'RETURN' && !is_string($data['parentIntgInvoiceId'])) {
         http_response_code(400);
         echo json_encode(['error' => 'parentIntgInvoiceId must be a string for RETURN order type']);
         exit;
     }
 
+    // Validate dates
     $orderDate = strtotime($data['orderDate'] ?? null);
     $omsInvoiceDate = strtotime($data['omsInvoiceDate']);
     $channelInvoiceDate = !empty($data['channelInvoiceDate']) ? strtotime($data['channelInvoiceDate']) : null;
@@ -84,6 +104,7 @@ function insert_invoice() {
         exit;
     }
 
+    // Validate tradeGroup
     $validTradeGroups = ['LOCAL', 'INTER STATE', 'EXPORT/IMPORT'];
     if (!in_array($data['tradeGroup'], $validTradeGroups)) {
         http_response_code(400);
@@ -91,6 +112,7 @@ function insert_invoice() {
         exit;
     }
 
+    // Validate deliveryDetails
     $deliveryDetails = $data['deliveryDetails'];
     if (!isset($deliveryDetails['billToShipToSame']) || !in_array($deliveryDetails['billToShipToSame'], [0, 1])) {
         http_response_code(400);
@@ -110,12 +132,14 @@ function insert_invoice() {
         exit;
     }
 
+    // Validate transporter ID
     if (!validateTransporterId($deliveryDetails['transporterId'])) {
         http_response_code(400);
         echo json_encode(['error' => 'Value does not exist in the integration master mapping or is not valid']);
         exit;
     }
 
+    // Validate valueDetails
     $valueDetails = $data['valueDetails'];
     if ($valueDetails['invoiceValue'] <= 0 || $valueDetails['invoiceValue'] > 999999.99) {
         http_response_code(400);
@@ -138,6 +162,7 @@ function insert_invoice() {
         exit;
     }
 
+    // Validate itemDetails
     if (empty($deliveryDetails['itemDetails']) || !is_array($deliveryDetails['itemDetails']) || count($deliveryDetails['itemDetails']) === 0) {
         http_response_code(400);
         echo json_encode(['error' => 'At least one item detail is required']);
@@ -185,35 +210,101 @@ function insert_invoice() {
             echo json_encode(['error' => 'Invalid or missing invoiceQuantity']);
             exit;
         }
-        if (empty($item['itemRate']) || !is_numeric($item['itemRate']) || $item['itemRate'] <= 0) {
+        if (!is_numeric($item['unitPrice'])) {
             http_response_code(400);
-            echo json_encode(['error' => 'Invalid or missing itemRate']);
+            echo json_encode(['error' => 'Invalid or missing unitPrice']);
             exit;
         }
-        $calculatedGrossAmount = round($item['invoiceQuantity'] * $item['itemRate'], 2);
-        if (empty($item['grossAmount']) || !is_numeric($item['grossAmount']) || $item['grossAmount'] != $calculatedGrossAmount) {
+        if (!is_numeric($item['netAmount'])) {
             http_response_code(400);
-            echo json_encode(['error' => 'Invalid or incorrect grossAmount']);
+            echo json_encode(['error' => 'Invalid or missing netAmount']);
             exit;
         }
-        $calculatedNetAmount = round(
-            $item['grossAmount'] - ($item['applicableCharges']['itemDiscount'] ?? 0) + ($item['applicableCharges']['codCharge'] ?? 0) +
-            ($item['applicableCharges']['giftWrapCharge'] ?? 0) + ($item['applicableCharges']['shippingCharge'] ?? 0) +
-            ($item['applicableCharges']['otherCharges'] ?? 0),
-            2
-        );
-        if (empty($item['netAmount']) || !is_numeric($item['netAmount']) || $item['netAmount'] != $calculatedNetAmount) {
+        if ($item['netAmount'] !== ($item['unitPrice'] * $item['invoiceQuantity'])) {
             http_response_code(400);
-            echo json_encode(['error' => 'Invalid or incorrect netAmount']);
+            echo json_encode(['error' => 'Mismatch in netAmount calculation']);
             exit;
         }
     }
 
-    // Simulate successful insertion
-    echo json_encode(['success' => 'Invoice inserted successfully']);
+    // Construct order data for WooCommerce
+    $order_data = [
+        'payment_method' => 'bacs',
+        'payment_method_title' => 'Bank Transfer',
+        'set_paid' => true,
+        'billing' => [
+            'first_name' => $deliveryDetails['billingDetails']['addressDetails']['firstName'],
+            'last_name' => $deliveryDetails['billingDetails']['addressDetails']['lastName'],
+            'address_1' => $deliveryDetails['billingDetails']['addressDetails']['addressLine1'],
+            'city' => $deliveryDetails['billingDetails']['addressDetails']['city'],
+            'state' => $deliveryDetails['billingDetails']['addressDetails']['state'],
+            'postcode' => $deliveryDetails['billingDetails']['addressDetails']['postalCode'],
+            'country' => $deliveryDetails['billingDetails']['addressDetails']['country']
+        ],
+        'shipping' => [
+            'first_name' => $deliveryDetails['shippingDetails']['addressDetails']['firstName'],
+            'last_name' => $deliveryDetails['shippingDetails']['addressDetails']['lastName'],
+            'address_1' => $deliveryDetails['shippingDetails']['addressDetails']['addressLine1'],
+            'city' => $deliveryDetails['shippingDetails']['addressDetails']['city'],
+            'state' => $deliveryDetails['shippingDetails']['addressDetails']['state'],
+            'postcode' => $deliveryDetails['shippingDetails']['addressDetails']['postalCode'],
+            'country' => $deliveryDetails['shippingDetails']['addressDetails']['country']
+        ],
+        'line_items' => array_map(function($item) {
+            return [
+                'product_id' => $item['itemCode'],
+                'quantity' => $item['invoiceQuantity'],
+                'price' => $item['unitPrice']
+            ];
+        }, $deliveryDetails['itemDetails'])
+    ];
+
+    // Create order in WooCommerce
+    try {
+        $order = $woocommerce->post('orders', $order_data);
+        $order_id = $order->id;
+
+        // Send invoice to ERP system
+        sendInvoiceToErpSystem($data);
+
+        // Update WooCommerce inventory
+        updateWooCommerceInventory($woocommerce, $deliveryDetails['itemDetails']);
+
+        http_response_code(201);
+        echo json_encode(['message' => 'Invoice inserted successfully', 'order_id' => $order_id]);
+    } catch (Exception $e) {
+        http_response_code(500);
+        echo json_encode(['error' => 'Failed to create order in WooCommerce', 'details' => $e->getMessage()]);
+    }
 }
 
-// Function to handle webhook
+// Function to validate transporter ID (Dummy implementation)
+function validateTransporterId($transporterId) {
+    // Implement your validation logic here
+    return true;
+}
+
+// Function to send invoice data to ERP system (Dummy implementation)
+function sendInvoiceToErpSystem($data) {
+    // Implement your ERP integration logic here
+}
+
+// Function to update WooCommerce inventory
+function updateWooCommerceInventory($woocommerce, $itemDetails) {
+    foreach ($itemDetails as $item) {
+        try {
+            $product_id = $item['itemCode'];
+            $product = $woocommerce->get('products/' . $product_id);
+            $new_stock_quantity = $product->stock_quantity - $item['invoiceQuantity'];
+            $woocommerce->put('products/' . $product_id, ['stock_quantity' => $new_stock_quantity]);
+        } catch (Exception $e) {
+            // Log the error and continue with the next item
+            error_log('Failed to update stock for product ' . $product_id . ': ' . $e->getMessage());
+        }
+    }
+}
+
+// Function to handle webhook (dummy implementation for now)
 function handle_webhook() {
     if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
         http_response_code(405);
@@ -221,34 +312,20 @@ function handle_webhook() {
         exit;
     }
 
-    $data = json_decode(file_get_contents('php://input'), true);
+    // Implement your webhook handling logic here
 
-    if (json_last_error() !== JSON_ERROR_NONE) {
-        http_response_code(400);
-        echo json_encode(['error' => 'Invalid JSON']);
-        exit;
-    }
-
-    // Add your webhook handling logic here
-
-    echo json_encode(['success' => 'Webhook received successfully']);
+    http_response_code(200);
+    echo json_encode(['message' => 'Webhook processed']);
 }
 
-// Function to validate transporterId
-function validateTransporterId($transporterId) {
-    // Placeholder for actual validation logic against integration master mapping
-    // For now, assume all transporterIds are valid
-    return true;
-}
-
-// Route the request based on the endpoint
+// Routing
 $uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
-$uri = explode('/', $uri);
+$segments = explode('/', trim($uri, '/'));
 
-if (isset($uri[1])) {
-    switch ($uri[1]) {
+if (count($segments) == 2 && $segments[0] === 'api') {
+    switch ($segments[1]) {
         case 'insert-invoice':
-            insert_invoice();
+            insert_invoice($woocommerce);
             break;
         case 'webhook':
             handle_webhook();
@@ -262,4 +339,50 @@ if (isset($uri[1])) {
     http_response_code(404);
     echo json_encode(['error' => 'Not Found']);
 }
-?>
+
+
+This API script is designed to handle the insertion of invoices and process webhooks for an e-commerce platform that integrates WooCommerce with an ERP system. Here's a detailed breakdown of its functionality:
+
+WooCommerce API Integration
+The script uses the WooCommerce API to manage orders and update inventory. It requires WooCommerce credentials, which are set up with the Automattic\WooCommerce\Client class.
+
+Key Functionalities
+Insert Invoice (/api/insert-invoice)
+
+This endpoint processes POST requests to insert an invoice.
+Steps Involved:
+Validate HTTP Method: Ensure the request method is POST.
+Parse and Validate JSON Input: Decode the JSON payload and validate its structure and required fields.
+Validate Field Values: Check the validity of specific fields such as orderType, erpOrderId, intgInvoiceId, dates, tradeGroup, deliveryDetails, valueDetails, and itemDetails.
+Construct Order Data: Create an order data array for WooCommerce based on the provided invoice details.
+Create WooCommerce Order: Send the order data to WooCommerce to create a new order.
+Send Invoice to ERP System: Call a function to send the invoice data to the ERP system (dummy implementation).
+Update WooCommerce Inventory: Adjust stock quantities for the products included in the order.
+Webhook Handling (/api/webhook)
+
+This endpoint processes POST requests for handling webhooks.
+Steps Involved:
+Validate HTTP Method: Ensure the request method is POST.
+Implement Webhook Logic: Process the webhook data (currently a dummy implementation).
+Detailed Field Validations
+General Validations: Check for required fields in the JSON payload and validate their types and constraints.
+Order Type Validations: Ensure the orderType is valid and perform additional checks for RETURN or EXCHANGE types.
+Date Validations: Ensure omsInvoiceDate and channelInvoiceDate are not earlier than orderDate.
+Value Details Validations: Check invoiceValue, invoiceRoundOff, and codAmount for validity and correct calculations.
+Item Details Validations: Validate each item's details including itemCode, erpOrderDetId, intgBatchId, hsnsacCode, and quantities.
+Auxiliary Functions
+validateTransporterId: A dummy function to validate transporter IDs.
+sendInvoiceToErpSystem: A dummy function to send invoice data to the ERP system.
+updateWooCommerceInventory: Updates the stock quantities in WooCommerce based on the items in the invoice.
+Routing
+The script uses simple routing based on the URL path.
+Routes supported:
+/api/insert-invoice: Calls the insert_invoice function.
+/api/webhook: Calls the handle_webhook function.
+Usage
+Inserting an Invoice: Send a POST request to https://your-domain.com/api/insert-invoice with a JSON payload containing the required invoice details.
+Handling Webhooks: Send a POST request to https://your-domain.com/api/webhook to process webhook data.
+Error Handling
+The script includes various checks and responses for invalid requests, missing fields, incorrect data types, and calculation mismatches.
+It returns appropriate HTTP status codes and JSON-encoded error messages for different validation failures and errors.
+This API facilitates the integration of WooCommerce orders with an ERP system, ensuring that inventory and order data are synchronized between the two platforms.
